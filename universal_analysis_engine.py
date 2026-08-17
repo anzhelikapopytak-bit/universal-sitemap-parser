@@ -1580,12 +1580,155 @@ class SheetsHub:
         )
         return result.get("values", [])
 
+    @staticmethod
+    def _sheet_title_from_a1_part(sheet_part: str) -> str:
+        """Convert an A1 sheet token like '1_ MAIN Brands' back to its title."""
+        value = safe_text(sheet_part).strip()
+        if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
+            value = value[1:-1].replace("''", "'")
+        return value
+
+    def ensure_row_capacity(
+        self,
+        sheet_title: str,
+        required_last_row: int,
+        growth_step: int = 1000,
+    ) -> None:
+        """Ensure a GRID sheet has enough rows before a values write.
+
+        The caller controls the growth step. Normal run preallocation uses an
+        exact deficit (step=1); last-moment write protection can still grow in
+        larger blocks. This prevents Google Sheets HTTP 400 grid-limit errors.
+        """
+        if required_last_row <= 0:
+            return
+        if growth_step <= 0:
+            raise ValueError("growth_step must be greater than zero")
+
+        props = self.sheets().get(sheet_title)
+        if props is None:
+            # Refresh once in case the sheet was created after the metadata cache.
+            self._sheets = None
+            props = self.sheets().get(sheet_title)
+        if props is None:
+            raise ValueError(f"Sheet not found while checking row capacity: {sheet_title}")
+
+        grid = props.get("gridProperties") or {}
+        current_rows = int(grid.get("rowCount") or 0)
+        if current_rows >= required_last_row:
+            return
+
+        missing_rows = required_last_row - current_rows
+        blocks = (missing_rows + growth_step - 1) // growth_step
+        rows_to_add = blocks * growth_step
+        sheet_id = props.get("sheetId")
+        if sheet_id is None:
+            raise ValueError(f"Sheet has no sheetId: {sheet_title}")
+
+        self._execute(
+            lambda: self.service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body={
+                    "requests": [
+                        {
+                            "appendDimension": {
+                                "sheetId": sheet_id,
+                                "dimension": "ROWS",
+                                "length": rows_to_add,
+                            }
+                        }
+                    ]
+                },
+            ),
+            f"appendRows:{sheet_title}:+{rows_to_add}",
+        )
+
+        new_row_count = current_rows + rows_to_add
+        # Keep the local metadata cache in sync so consecutive writes do not
+        # perform unnecessary growth requests in the same run.
+        props.setdefault("gridProperties", {})["rowCount"] = new_row_count
+        print(
+            f"[sheet-grow] {sheet_title}: {current_rows} -> {new_row_count} "
+            f"(+{rows_to_add}); required={required_last_row}",
+            flush=True,
+        )
+
+    def ensure_append_capacity(
+        self,
+        a1_range: str,
+        additional_rows: int,
+    ) -> None:
+        """Reserve enough physical rows for an upcoming append workload.
+
+        The caller already knows how many queue rows are going to be processed.
+        We use that count to reserve capacity once, before analysis starts, instead
+        of discovering the grid limit one chunk at a time while writing results.
+        Existing unused grid rows are reused; only the actual deficit is added.
+        """
+        if additional_rows <= 0:
+            return
+        if "!" not in a1_range:
+            raise ValueError(
+                f"ensure_append_capacity requires a sheet-qualified range: {a1_range}"
+            )
+
+        sheet_part, _ = a1_range.rsplit("!", 1)
+        sheet_title = self._sheet_title_from_a1_part(sheet_part)
+        existing_rows = len(self.get_values(a1_range))
+        required_last_row = existing_rows + int(additional_rows)
+
+        props = self.sheets().get(sheet_title)
+        current_rows = int(((props or {}).get("gridProperties") or {}).get("rowCount") or 0)
+        deficit = max(0, required_last_row - current_rows)
+
+        if deficit > 0:
+            self.ensure_row_capacity(
+                sheet_title,
+                required_last_row,
+                growth_step=1,  # add exactly the missing number of rows
+            )
+
+        print(
+            f"[sheet-reserve] {sheet_title}: existing_data={existing_rows}; "
+            f"planned={additional_rows}; required={required_last_row}; "
+            f"grid_before={current_rows}; added={deficit}",
+            flush=True,
+        )
+
+    def _ensure_capacity_for_update(
+        self,
+        a1_range: str,
+        payload: Sequence[Sequence[object]],
+    ) -> None:
+        """Best-effort A1 parsing for row-based values.update writes."""
+        if not payload or "!" not in a1_range:
+            return
+
+        sheet_part, cell_part = a1_range.rsplit("!", 1)
+        # values.update calls in this script start from an explicit row, e.g.
+        # A1, A1090, A12:N12, K500:L500. Column-only ranges are ignored.
+        start_match = re.match(r"\s*(?:[A-Za-z]+)?(\d+)", cell_part)
+        if not start_match:
+            return
+
+        start_row = int(start_match.group(1))
+        required_last_row = start_row + len(payload) - 1
+        sheet_title = self._sheet_title_from_a1_part(sheet_part)
+        if sheet_title:
+            self.ensure_row_capacity(sheet_title, required_last_row, growth_step=1000)
+
     def update_values(
         self,
         a1_range: str,
         values: Sequence[Sequence[object]],
     ) -> None:
         payload = [list(x) for x in values]
+        if not payload:
+            return
+
+        # Always make sure the destination rows physically exist before writing.
+        self._ensure_capacity_for_update(a1_range, payload)
+
         self._execute(
             lambda: self.service.spreadsheets().values().update(
                 spreadsheetId=self.spreadsheet_id,
@@ -2141,6 +2284,21 @@ def main() -> int:
 
     pending = load_queue(hub, project_id)
     stats = RunStats(pending_total=len(pending))
+
+    # The queue is already populated from exported sitemaps/URLs, so at this
+    # point we know exactly how many rows this run may process. Reserve that
+    # amount of append capacity on every visible result sheet before analysis.
+    # Each processed URL can contribute at most one row to any one of these
+    # result sheets, therefore len(pending) is a safe upper bound per sheet.
+    if pending:
+        planned_rows = len(pending)
+        for reserve_range in (
+            f"{control.q(names['main_brands'])}!A:N",
+            f"{control.q(names['missing_brands'])}!A:H",
+            f"{control.q(names['categories'])}!A:G",
+            f"{control.q(names['missing_categories'])}!A:G",
+        ):
+            control.ensure_append_capacity(reserve_range, planned_rows)
 
     run_rows_before = hub.get_values(f"{hub.q(ANALYSIS_RUNS_SHEET)}!A:N")
     run_sheet_row = len(run_rows_before) + 1
