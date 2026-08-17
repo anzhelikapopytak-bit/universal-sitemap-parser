@@ -136,6 +136,11 @@ QUEUE_SHEET = "_GP_URL_QUEUE"
 CACHE_SHEET = "_GP_ANALYSIS_CACHE"
 ANALYSIS_RUNS_SHEET = "_GP_ANALYSIS_RUNS"
 
+# Enrichment-only circuit breaker. If one host repeatedly rejects optional
+# Bonus/ref_link fetches with HTTP 403, stop enrichment for that host for the
+# rest of the current run. BRAND/CATEGORY classification is never affected.
+ENRICHMENT_403_DISABLE_THRESHOLD = 50
+
 QUEUE_REQUIRED_HEADERS = [
     "Run ID",
     "Exported At",
@@ -296,6 +301,10 @@ def host_of(url: str) -> str:
     except Exception:
         host = ""
     return host[4:] if host.startswith("www.") else host
+
+
+def is_http_403_error(message: str) -> bool:
+    return bool(re.search(r"\bHTTP\s+403\b", safe_text(message), flags=re.I))
 
 
 def is_non_content_url(url: str) -> bool:
@@ -2280,6 +2289,13 @@ def main() -> int:
         # happened after Control writes but before queue checkpoint.
         output_keys = load_output_keys(control, names)
 
+        # Optional enrichment is deliberately isolated from classification.
+        # A host that returns 50 consecutive HTTP 403 responses for Bonus/ref_link
+        # is skipped for enrichment for the rest of this run, while BRAND/CATEGORY
+        # processing continues normally.
+        enrichment_403_streaks: Dict[str, int] = {}
+        enrichment_disabled_hosts: Set[str] = set()
+
         # 2) Competitor pages in restart-safe checkpoints.
         # Sources using the promo-tail profile run after ordinary sources so
         # their extractor can use brands already discovered elsewhere.
@@ -2336,18 +2352,46 @@ def main() -> int:
 
                         # Only missing brands need bonus/ref enrichment.
                         if not matched:
-                            ctx = PageContext(result.queue, fetcher)
-                            result.bonus = extract_bonus(ctx, result.source)
-                            result.ref_link = extract_ref_link(ctx, result.source)
+                            enrichment_host = host_of(result.queue.url)
 
-                            # Classification itself succeeded. An enrichment-only
-                            # fetch failure should not make us lose the discovered brand.
-                            if ctx.fetch_error and not result.bonus and not result.ref_link:
-                                print(
-                                    f"[enrichment-warning] {result.queue.url}: "
-                                    f"{ctx.fetch_error}",
-                                    flush=True,
-                                )
+                            if enrichment_host not in enrichment_disabled_hosts:
+                                ctx = PageContext(result.queue, fetcher)
+                                result.bonus = extract_bonus(ctx, result.source)
+                                result.ref_link = extract_ref_link(ctx, result.source)
+
+                                # Classification itself succeeded. An enrichment-only
+                                # fetch failure should not make us lose the discovered brand.
+                                if ctx.fetch_error and not result.bonus and not result.ref_link:
+                                    if enrichment_host and is_http_403_error(ctx.fetch_error):
+                                        streak = enrichment_403_streaks.get(enrichment_host, 0) + 1
+                                        enrichment_403_streaks[enrichment_host] = streak
+
+                                        if streak >= ENRICHMENT_403_DISABLE_THRESHOLD:
+                                            enrichment_disabled_hosts.add(enrichment_host)
+                                            print(
+                                                f"[enrichment-disabled] host={enrichment_host} "
+                                                f"after {streak} consecutive HTTP 403 "
+                                                f"enrichment failures; Bonus/ref_link will be "
+                                                f"skipped for this host until the run ends.",
+                                                flush=True,
+                                            )
+                                        else:
+                                            print(
+                                                f"[enrichment-warning] {result.queue.url}: "
+                                                f"{ctx.fetch_error}",
+                                                flush=True,
+                                            )
+                                    else:
+                                        if enrichment_host:
+                                            enrichment_403_streaks[enrichment_host] = 0
+                                        print(
+                                            f"[enrichment-warning] {result.queue.url}: "
+                                            f"{ctx.fetch_error}",
+                                            flush=True,
+                                        )
+                                elif enrichment_host:
+                                    # Any successful enrichment fetch breaks the 403 streak.
+                                    enrichment_403_streaks[enrichment_host] = 0
 
                         comp_url_key = result.queue.url.lower()
                         brand_site_key = (
