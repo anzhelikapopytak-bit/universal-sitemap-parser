@@ -1344,15 +1344,38 @@ def extract_faq_answer(raw: str, needle: str) -> str:
 
 def generic_bonus(raw: str) -> str:
     plain = strip_tags(raw)
+
+    # Order matters: prefer the most complete compound offer before shorter
+    # fragments such as only "125 freespins".
     patterns = (
-        # Nordic cashback wording. Require the cashback keyword so a normal
-        # minimum-deposit amount such as "200 kroner" is not mistaken for a bonus.
-        r"\b\d{1,6}(?:[.,]\d{1,2})?\s*(?:kr|kroner)\s+(?:i\s+)?cash(?:b)?ack(?:\s+(?:på|pa)\s+\d+\s+innskudd)?(?:\s+uten\s+omsetningskrav)?",
-        r"\b(?:NOK|kr)\s*\d{1,6}(?:[.,]\d{1,2})?\s+(?:i\s+)?cash(?:b)?ack(?:\s+(?:på|pa)\s+\d+\s+innskudd)?(?:\s+uten\s+omsetningskrav)?",
+        # "100% opptil 100 MegaSpins"
+        r"\b\d{1,3}\s*%\s*(?:opptil|opp\s+til|up\s+to)\s*\d{1,5}\s*(?:mega\s*spins?|megaspins?|free\s*spins?|freespins?|spins?)\b",
+
+        # "2000 kr og 125 freespins" / "2000 kr + 125 free spins"
+        r"\b\d{1,6}(?:[.,]\d{1,2})?\s*(?:kr|kroner)\s*(?:\+|og|and|&)\s*\d{1,5}\s*(?:mega\s*spins?|megaspins?|free\s*spins?|freespins?|spins?)\b",
+        r"\b(?:NOK|SEK|DKK)\s*\d{1,6}(?:[.,]\d{1,2})?\s*(?:\+|og|and|&)\s*\d{1,5}\s*(?:mega\s*spins?|megaspins?|free\s*spins?|freespins?|spins?)\b",
+
+        # "100% opptil 2000 kr + 200 freespins"
+        r"\b\d{1,3}\s*%\s*(?:opptil|opp\s+til|up\s+to|jusqu[’'`]?a|jusqu[’'`]?à)?\s*"
+        r"\d{1,6}(?:[.,]\d{1,2})?\s*(?:kr|kroner|NOK|SEK|DKK|€|EUR|£|GBP|\$|USD|CAD|CHF)"
+        r"(?:\s*(?:\+|og|and|&)\s*\d{1,5}\s*(?:mega\s*spins?|megaspins?|free\s*spins?|freespins?|spins?))?",
+
+        # Nordic cashback wording.
+        r"\b\d{1,6}(?:[.,]\d{1,2})?\s*(?:kr|kroner)\s+(?:i\s+)?cash(?:b)?ack"
+        r"(?:\s+(?:på|pa)\s+\d+\s+innskudd)?(?:\s+uten\s+omsetningskrav)?",
+        r"\b(?:NOK|SEK|DKK|kr)\s*\d{1,6}(?:[.,]\d{1,2})?\s+(?:i\s+)?cash(?:b)?ack"
+        r"(?:\s+(?:på|pa)\s+\d+\s+innskudd)?(?:\s+uten\s+omsetningskrav)?",
         r"\b\d{1,3}\s*%\s*cash(?:b)?ack\b",
-        r"\b\d{1,3}\s*%\s*(?:up\s*to|jusqu[’'`]?a|jusqu[’'`]?à|bonus)?\s*(?:C?\$|€|£)?\s*\d{1,6}(?:[.,]\d{1,2})?(?:\s*\+\s*\d{1,5}\s*(?:free\s*spins?|tours?\s+gratuits?|FS))?",
-        r"\b(?:C?\$|€|£)\s*\d{1,6}(?:[.,]\d{1,2})?(?:\s*\+\s*\d{1,5}\s*(?:free\s*spins?|tours?\s+gratuits?|FS))?",
-        r"\b\d{1,5}\s*(?:free\s*spins?|tours?\s+gratuits?|FS)\b",
+
+        # Existing generic international patterns.
+        r"\b\d{1,3}\s*%\s*(?:up\s*to|jusqu[’'`]?a|jusqu[’'`]?à|bonus)?\s*"
+        r"(?:C?\$|€|£)?\s*\d{1,6}(?:[.,]\d{1,2})?"
+        r"(?:\s*\+\s*\d{1,5}\s*(?:free\s*spins?|freespins?|tours?\s+gratuits?|FS))?",
+        r"\b(?:C?\$|€|£)\s*\d{1,6}(?:[.,]\d{1,2})?"
+        r"(?:\s*\+\s*\d{1,5}\s*(?:free\s*spins?|freespins?|tours?\s+gratuits?|FS))?",
+
+        # Single spins last, so compound offers are not truncated.
+        r"\b\d{1,5}\s*(?:mega\s*spins?|megaspins?|free\s*spins?|freespins?|tours?\s+gratuits?|FS)\b",
     )
 
     for pattern in patterns:
