@@ -97,6 +97,7 @@ Bonus Footprint is a priority/combination list:
     attr:data-offer
     class:bonus-title|generic
     data-testid:brand-banner-bonus-text|data-testid:brand-banner-additional-bonus
+    faq:velkomstbonus|section-id:velkomstbonus
 
 Ref Rule:
     attr:data-affiliate-url
@@ -1219,9 +1220,136 @@ def extract_brand(
     return ""
 
 
+
+def normalize_bonus_lookup(value: str) -> str:
+    """Normalize a short FAQ/section lookup token without changing page text."""
+    s = ascii_fold(html_lib.unescape(safe_text(value))).lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return normalize_space(s)
+
+
+def extract_section_html_by_id(raw: str, section_id: str) -> str:
+    """
+    Return only the content that belongs to a heading containing id=section_id.
+
+    The section starts after that heading and ends at the next heading of the
+    same or higher level. This prevents bonus extraction from leaking into
+    unrelated casino cards or recommendation blocks later on the page.
+    """
+    if not raw or not section_id:
+        return ""
+
+    id_match = re.search(
+        rf"""\bid\s*=\s*(["']){re.escape(section_id)}\1""",
+        raw,
+        flags=re.I,
+    )
+    if not id_match:
+        return ""
+
+    heading_matches = list(
+        re.finditer(r"(?is)<h([1-6])\b[^>]*>", raw[:id_match.start()])
+    )
+    if not heading_matches:
+        return ""
+
+    heading = heading_matches[-1]
+    level = int(heading.group(1))
+
+    close_match = re.search(
+        rf"(?is)</h{level}\s*>",
+        raw[id_match.end():],
+    )
+    if not close_match:
+        return ""
+
+    start = id_match.end() + close_match.end()
+    next_heading = re.search(
+        rf"(?is)<h([1-{level}])\b[^>]*>",
+        raw[start:],
+    )
+    end = start + next_heading.start() if next_heading else len(raw)
+    return raw[start:end]
+
+
+def extract_faq_answer(raw: str, needle: str) -> str:
+    """
+    Find an FAQ question containing needle and return only its answer.
+
+    Supports the visible <details> FAQ structure first and then JSON-LD
+    FAQPage/Question markup as a generic fallback.
+    """
+    target = normalize_bonus_lookup(needle)
+    if not raw or not target:
+        return ""
+
+    for details_match in re.finditer(
+        r"(?is)<details\b[^>]*>(.*?)</details\s*>",
+        raw,
+    ):
+        block = details_match.group(1)
+
+        question_match = re.search(
+            r"""(?is)<[^>]*class=(["'])[^"']*\bqa-question\b[^"']*\1[^>]*>(.*?)</[^>]+>""",
+            block,
+        )
+        question = (
+            strip_tags(question_match.group(2))
+            if question_match
+            else strip_tags(block[:2000])
+        )
+
+        if target not in normalize_bonus_lookup(question):
+            continue
+
+        answer_match = re.search(
+            r"""(?is)<div\b[^>]*class=(["'])[^"']*\bfaq-content\b[^"']*\1[^>]*>(.*?)</div\s*>""",
+            block,
+        )
+        if answer_match:
+            answer = strip_tags(answer_match.group(2))
+            if answer:
+                return answer
+
+    # Generic structured-data fallback for FAQPage/Question JSON-LD.
+    for script_match in re.finditer(
+        r"""(?is)<script\b[^>]*type=(["'])application/ld\+json\1[^>]*>(.*?)</script\s*>""",
+        raw,
+    ):
+        try:
+            data = json.loads(html_lib.unescape(script_match.group(2)).strip())
+        except Exception:
+            continue
+
+        stack = [data]
+        while stack:
+            item = stack.pop()
+
+            if isinstance(item, dict):
+                if safe_text(item.get("@type")).lower() == "question":
+                    question = safe_text(item.get("name"))
+                    if target in normalize_bonus_lookup(question):
+                        accepted = item.get("acceptedAnswer")
+                        if isinstance(accepted, dict):
+                            answer = strip_tags(safe_text(accepted.get("text")))
+                            if answer:
+                                return answer
+
+                stack.extend(item.values())
+
+            elif isinstance(item, list):
+                stack.extend(item)
+
+    return ""
+
 def generic_bonus(raw: str) -> str:
     plain = strip_tags(raw)
     patterns = (
+        # Nordic cashback wording. Require the cashback keyword so a normal
+        # minimum-deposit amount such as "200 kroner" is not mistaken for a bonus.
+        r"\b\d{1,6}(?:[.,]\d{1,2})?\s*(?:kr|kroner)\s+(?:i\s+)?cash(?:b)?ack(?:\s+(?:på|pa)\s+\d+\s+innskudd)?(?:\s+uten\s+omsetningskrav)?",
+        r"\b(?:NOK|kr)\s*\d{1,6}(?:[.,]\d{1,2})?\s+(?:i\s+)?cash(?:b)?ack(?:\s+(?:på|pa)\s+\d+\s+innskudd)?(?:\s+uten\s+omsetningskrav)?",
+        r"\b\d{1,3}\s*%\s*cash(?:b)?ack\b",
         r"\b\d{1,3}\s*%\s*(?:up\s*to|jusqu[’'`]?a|jusqu[’'`]?à|bonus)?\s*(?:C?\$|€|£)?\s*\d{1,6}(?:[.,]\d{1,2})?(?:\s*\+\s*\d{1,5}\s*(?:free\s*spins?|tours?\s+gratuits?|FS))?",
         r"\b(?:C?\$|€|£)\s*\d{1,6}(?:[.,]\d{1,2})?(?:\s*\+\s*\d{1,5}\s*(?:free\s*spins?|tours?\s+gratuits?|FS))?",
         r"\b\d{1,5}\s*(?:free\s*spins?|tours?\s+gratuits?|FS)\b",
@@ -1249,6 +1377,23 @@ def extract_bonus(ctx: PageContext, source: SourceConfig) -> str:
         if low == "generic":
             value = generic_bonus(ctx.html())
 
+        elif low.startswith("faq:"):
+            needle = token.split(":", 1)[1].strip()
+            answer = extract_faq_answer(ctx.html(), needle)
+            if answer:
+                # Prefer a concise bonus phrase, but keep the FAQ answer when
+                # it uses wording not covered by generic_bonus().
+                value = generic_bonus(answer) or answer
+                return normalize_space(value)[:500]
+
+        elif low.startswith("section-id:"):
+            section_id = token.split(":", 1)[1].strip()
+            section_html = extract_section_html_by_id(ctx.html(), section_id)
+            if section_html:
+                value = generic_bonus(section_html)
+                if value:
+                    return normalize_space(value)[:500]
+
         elif low.startswith("attr:"):
             value = extract_attr(ctx.html(), token.split(":", 1)[1].strip())
 
@@ -1268,7 +1413,7 @@ def extract_bonus(ctx: PageContext, source: SourceConfig) -> str:
             if match:
                 value = match.group(1) if match.groups() else match.group(0)
 
-        # Legacy/unrecognized values get a safe generic fallback.
+        # Preserve legacy behavior for old/unrecognized values.
         else:
             value = generic_bonus(ctx.html())
 
