@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Universal Analysis Engine V3 CHECKPOINTED
+Universal Analysis Engine V4 TABLE-DRIVEN BONUS
 
 Purpose
 -------
@@ -41,8 +41,10 @@ Expected payload (GZIP + Base64URL JSON), schema_version = 1:
         "url-tail",
 
       "bonus_footprint":
-        "data-testid:brand-banner-bonus-text|"
-        "data-testid:brand-banner-additional-bonus",
+        "faq:welcome bonus|section-id:welcome-bonus|meta:description|title",
+
+      "bonus_extraction_rule":
+        "REGEX SUPPLIED BY CONTROL TABLE FOR THIS SOURCE/GEO",
 
       "category_url_patterns":
         "path:/bonus/|h1-regex:(bonus|casino)",
@@ -93,11 +95,26 @@ Brand Extraction Rule is a priority list separated by "|":
     url-after:/casinos-en-ligne/|url-tail
     h1|url-tail
 
-Bonus Footprint is a priority/combination list:
-    attr:data-offer
-    class:bonus-title|generic
-    data-testid:brand-banner-bonus-text|data-testid:brand-banner-additional-bonus
-    faq:velkomstbonus|section-id:velkomstbonus
+Bonus Footprint describes WHERE bonus text may be found. Tokens are checked
+in table-defined order when Bonus Extraction Rule is present:
+    faq:QUESTION_TEXT
+    section-id:HTML_ID
+    heading-regex:REGEX
+    meta:description
+    meta:og:description
+    title
+    attr:ATTRIBUTE
+    class:CLASS_FRAGMENT
+    data-testid:VALUE
+    regex-html:REGEX
+    page
+    generic
+
+Bonus Extraction Rule describes WHAT to extract from each Bonus Footprint
+source. It is a plain regular expression supplied by the Control table.
+The first non-empty capturing group is returned; if there is no capturing
+group, the full match is returned. If this field is blank, legacy bonus
+behavior is preserved for backward compatibility.
 
 Ref Rule:
     attr:data-affiliate-url
@@ -491,6 +508,7 @@ class SourceConfig:
     category_url_patterns: str
     affiliate_network: str
     ref_rule: str
+    bonus_extraction_rule: str = ""
 
     @staticmethod
     def from_dict(data: dict, default_project_id: str) -> "SourceConfig":
@@ -508,6 +526,7 @@ class SourceConfig:
             category_url_patterns=safe_text(data.get("category_url_patterns")),
             affiliate_network=safe_text(data.get("affiliate_network")),
             ref_rule=safe_text(data.get("ref_rule")),
+            bonus_extraction_rule=safe_text(data.get("bonus_extraction_rule")),
         )
 
 
@@ -1220,77 +1239,99 @@ def extract_brand(
     return ""
 
 
-
 def normalize_bonus_lookup(value: str) -> str:
-    """Normalize a short FAQ/section lookup token without changing page text."""
+    """Normalize selector text only; no GEO/language bonus vocabulary lives here."""
     s = ascii_fold(html_lib.unescape(safe_text(value))).lower()
     s = re.sub(r"[^a-z0-9]+", " ", s)
     return normalize_space(s)
 
 
 def extract_section_html_by_id(raw: str, section_id: str) -> str:
-    """
-    Return only the content that belongs to a heading containing id=section_id.
-
-    The section starts after that heading and ends at the next heading of the
-    same or higher level. This prevents bonus extraction from leaking into
-    unrelated casino cards or recommendation blocks later on the page.
-    """
+    """Return the matching heading plus its bounded section content."""
     if not raw or not section_id:
         return ""
 
-    id_match = re.search(
-        rf"""\bid\s*=\s*(["']){re.escape(section_id)}\1""",
-        raw,
-        flags=re.I,
-    )
+    id_pattern = rf'''\bid\s*=\s*(["']){re.escape(section_id)}\1'''
+    id_match = re.search(id_pattern, raw, flags=re.I)
     if not id_match:
         return ""
 
     heading_matches = list(
         re.finditer(r"(?is)<h([1-6])\b[^>]*>", raw[:id_match.start()])
     )
-    if not heading_matches:
+
+    direct_matches = list(
+        re.finditer(
+            rf'''(?is)<h([1-6])\b[^>]*\bid\s*=\s*(["']){re.escape(section_id)}\2[^>]*>''',
+            raw,
+        )
+    )
+    direct = next(
+        (m for m in direct_matches if m.start() <= id_match.start() <= m.end()),
+        None,
+    )
+
+    if direct:
+        heading = direct
+    elif heading_matches:
+        heading = heading_matches[-1]
+    else:
         return ""
 
-    heading = heading_matches[-1]
     level = int(heading.group(1))
-
-    close_match = re.search(
-        rf"(?is)</h{level}\s*>",
-        raw[id_match.end():],
-    )
+    close_match = re.search(rf"(?is)</h{level}\s*>", raw[heading.end():])
     if not close_match:
         return ""
 
-    start = id_match.end() + close_match.end()
+    after_heading = heading.end() + close_match.end()
     next_heading = re.search(
-        rf"(?is)<h([1-{level}])\b[^>]*>",
-        raw[start:],
+        rf"(?is)<h([1-{level}])\b[^>]*>", raw[after_heading:]
     )
-    end = start + next_heading.start() if next_heading else len(raw)
-    return raw[start:end]
+    section_end = after_heading + next_heading.start() if next_heading else len(raw)
+    return raw[heading.start():section_end]
+
+
+def extract_section_html_by_heading_regex(raw: str, pattern: str) -> str:
+    """Return first H1-H6 section whose heading matches table-supplied regex."""
+    if not raw or not pattern:
+        return ""
+
+    headings = list(
+        re.finditer(r"(?is)<h([1-6])\b([^>]*)>(.*?)</h\1\s*>", raw)
+    )
+    for index, heading in enumerate(headings):
+        searchable = normalize_space(
+            f"{heading.group(2)} {strip_tags(heading.group(3))}"
+        )
+        try:
+            matched = re.search(pattern, searchable, flags=re.I | re.S)
+        except re.error:
+            return ""
+        if not matched:
+            continue
+
+        level = int(heading.group(1))
+        section_end = len(raw)
+        for later in headings[index + 1:]:
+            if int(later.group(1)) <= level:
+                section_end = later.start()
+                break
+        return raw[heading.start():section_end]
+    return ""
 
 
 def extract_faq_answer(raw: str, needle: str) -> str:
-    """
-    Find an FAQ question containing needle and return only its answer.
-
-    Supports the visible <details> FAQ structure first and then JSON-LD
-    FAQPage/Question markup as a generic fallback.
-    """
+    """Return answer for an FAQ question containing table-supplied needle."""
     target = normalize_bonus_lookup(needle)
     if not raw or not target:
         return ""
 
     for details_match in re.finditer(
-        r"(?is)<details\b[^>]*>(.*?)</details\s*>",
-        raw,
+        r"(?is)<details\b[^>]*>(.*?)</details\s*>", raw
     ):
         block = details_match.group(1)
-
         question_match = re.search(
-            r"""(?is)<[^>]*class=(["'])[^"']*\bqa-question\b[^"']*\1[^>]*>(.*?)</[^>]+>""",
+            r'''(?is)<[^>]*class=(["'])[^"']*\bqa-question\b[^"']*\1[^>]*>(.*?)</[^>]+>''',
             block,
         )
         question = (
@@ -1298,12 +1339,11 @@ def extract_faq_answer(raw: str, needle: str) -> str:
             if question_match
             else strip_tags(block[:2000])
         )
-
         if target not in normalize_bonus_lookup(question):
             continue
 
         answer_match = re.search(
-            r"""(?is)<div\b[^>]*class=(["'])[^"']*\bfaq-content\b[^"']*\1[^>]*>(.*?)</div\s*>""",
+            r'''(?is)<div\b[^>]*class=(["'])[^"']*\bfaq-content\b[^"']*\1[^>]*>(.*?)</div\s*>''',
             block,
         )
         if answer_match:
@@ -1311,9 +1351,17 @@ def extract_faq_answer(raw: str, needle: str) -> str:
             if answer:
                 return answer
 
-    # Generic structured-data fallback for FAQPage/Question JSON-LD.
+        cleaned = re.sub(
+            r"(?is)<summary\b[^>]*>.*?</summary\s*>", " ", block
+        )
+        if question_match:
+            cleaned = cleaned.replace(question_match.group(0), " ")
+        answer = strip_tags(cleaned)
+        if answer:
+            return answer
+
     for script_match in re.finditer(
-        r"""(?is)<script\b[^>]*type=(["'])application/ld\+json\1[^>]*>(.*?)</script\s*>""",
+        r'''(?is)<script\b[^>]*type=(["'])application/ld\+json\1[^>]*>(.*?)</script\s*>''',
         raw,
     ):
         try:
@@ -1324,7 +1372,6 @@ def extract_faq_answer(raw: str, needle: str) -> str:
         stack = [data]
         while stack:
             item = stack.pop()
-
             if isinstance(item, dict):
                 if safe_text(item.get("@type")).lower() == "question":
                     question = safe_text(item.get("name"))
@@ -1334,109 +1381,178 @@ def extract_faq_answer(raw: str, needle: str) -> str:
                             answer = strip_tags(safe_text(accepted.get("text")))
                             if answer:
                                 return answer
-
                 stack.extend(item.values())
-
             elif isinstance(item, list):
                 stack.extend(item)
-
     return ""
 
-def generic_bonus(raw: str) -> str:
+
+def extract_meta_content(raw: str, meta_name: str) -> str:
+    """Return content from <meta name=...> or <meta property=...>."""
+    target = safe_text(meta_name).strip().lower()
+    if not raw or not target:
+        return ""
+
+    for match in re.finditer(r"(?is)<meta\b[^>]*>", raw):
+        tag = match.group(0)
+        attrs = {}
+        for attr_match in re.finditer(
+            r'''(?is)\b([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(["'])(.*?)\2''',
+            tag,
+        ):
+            attrs[attr_match.group(1).lower()] = html_lib.unescape(
+                attr_match.group(3)
+            )
+
+        key = safe_text(
+            attrs.get("name") or attrs.get("property")
+        ).strip().lower()
+        if key == target:
+            return normalize_space(attrs.get("content", ""))
+    return ""
+
+
+def extract_title_text(raw: str) -> str:
+    match = re.search(r"(?is)<title\b[^>]*>(.*?)</title\s*>", raw or "")
+    return strip_tags(match.group(1)) if match else ""
+
+
+def apply_bonus_extraction_rule(raw: str, rule: str) -> str:
+    """Apply the table-supplied bonus regex to visible text from one scope."""
+    pattern = safe_text(rule).strip()
+    if not raw or not pattern:
+        return ""
+
     plain = strip_tags(raw)
+    try:
+        match = re.search(pattern, plain, flags=re.I | re.S)
+    except re.error as exc:
+        LOGGER.warning("Invalid bonus_extraction_rule regex: %s", exc)
+        return ""
 
-    # Order matters: prefer the most complete compound offer before shorter
-    # fragments such as only "125 freespins".
+    if not match:
+        return ""
+
+    if match.groups():
+        for group in match.groups():
+            if group:
+                return normalize_space(group)[:500]
+
+    return normalize_space(match.group(0))[:500]
+
+
+def extract_bonus_source(ctx: PageContext, token: str) -> str:
+    """Resolve one universal Bonus Footprint token to scoped text/HTML."""
+    low = token.lower()
+
+    if low in ("page", "generic"):
+        return ctx.html()
+    if low.startswith("faq:"):
+        return extract_faq_answer(
+            ctx.html(), token.split(":", 1)[1].strip()
+        )
+    if low.startswith("section-id:"):
+        return extract_section_html_by_id(
+            ctx.html(), token.split(":", 1)[1].strip()
+        )
+    if low.startswith("heading-regex:"):
+        return extract_section_html_by_heading_regex(
+            ctx.html(), token.split(":", 1)[1].strip()
+        )
+    if low.startswith("meta:"):
+        return extract_meta_content(
+            ctx.html(), token.split(":", 1)[1].strip()
+        )
+    if low == "title":
+        return extract_title_text(ctx.html())
+    if low.startswith("attr:"):
+        return extract_attr(
+            ctx.html(), token.split(":", 1)[1].strip()
+        )
+    if low.startswith("class:"):
+        return extract_text_by_class_contains(
+            ctx.html(), token.split(":", 1)[1].strip()
+        )
+    if low.startswith("data-testid:"):
+        return extract_text_by_data_testid(
+            ctx.html(), token.split(":", 1)[1].strip()
+        )
+    if low.startswith("regex-html:"):
+        pattern = token.split(":", 1)[1].strip()
+        try:
+            match = re.search(pattern, ctx.html(), flags=re.I | re.S)
+        except re.error:
+            return ""
+        if match:
+            return match.group(1) if match.groups() else match.group(0)
+    return ""
+
+
+def generic_bonus(raw: str) -> str:
+    """Legacy generic extractor retained unchanged for old configurations."""
+    plain = strip_tags(raw)
     patterns = (
-        # "100% opptil 100 MegaSpins"
-        r"\b\d{1,3}\s*%\s*(?:opptil|opp\s+til|up\s+to)\s*\d{1,5}\s*(?:mega\s*spins?|megaspins?|free\s*spins?|freespins?|spins?)\b",
-
-        # "2000 kr og 125 freespins" / "2000 kr + 125 free spins"
-        r"\b\d{1,6}(?:[.,]\d{1,2})?\s*(?:kr|kroner)\s*(?:\+|og|and|&)\s*\d{1,5}\s*(?:mega\s*spins?|megaspins?|free\s*spins?|freespins?|spins?)\b",
-        r"\b(?:NOK|SEK|DKK)\s*\d{1,6}(?:[.,]\d{1,2})?\s*(?:\+|og|and|&)\s*\d{1,5}\s*(?:mega\s*spins?|megaspins?|free\s*spins?|freespins?|spins?)\b",
-
-        # "100% opptil 2000 kr + 200 freespins"
-        r"\b\d{1,3}\s*%\s*(?:opptil|opp\s+til|up\s+to|jusqu[’'`]?a|jusqu[’'`]?à)?\s*"
-        r"\d{1,6}(?:[.,]\d{1,2})?\s*(?:kr|kroner|NOK|SEK|DKK|€|EUR|£|GBP|\$|USD|CAD|CHF)"
-        r"(?:\s*(?:\+|og|and|&)\s*\d{1,5}\s*(?:mega\s*spins?|megaspins?|free\s*spins?|freespins?|spins?))?",
-
-        # Nordic cashback wording.
-        r"\b\d{1,6}(?:[.,]\d{1,2})?\s*(?:kr|kroner)\s+(?:i\s+)?cash(?:b)?ack"
-        r"(?:\s+(?:på|pa)\s+\d+\s+innskudd)?(?:\s+uten\s+omsetningskrav)?",
-        r"\b(?:NOK|SEK|DKK|kr)\s*\d{1,6}(?:[.,]\d{1,2})?\s+(?:i\s+)?cash(?:b)?ack"
-        r"(?:\s+(?:på|pa)\s+\d+\s+innskudd)?(?:\s+uten\s+omsetningskrav)?",
-        r"\b\d{1,3}\s*%\s*cash(?:b)?ack\b",
-
-        # Existing generic international patterns.
-        r"\b\d{1,3}\s*%\s*(?:up\s*to|jusqu[’'`]?a|jusqu[’'`]?à|bonus)?\s*"
-        r"(?:C?\$|€|£)?\s*\d{1,6}(?:[.,]\d{1,2})?"
-        r"(?:\s*\+\s*\d{1,5}\s*(?:free\s*spins?|freespins?|tours?\s+gratuits?|FS))?",
-        r"\b(?:C?\$|€|£)\s*\d{1,6}(?:[.,]\d{1,2})?"
-        r"(?:\s*\+\s*\d{1,5}\s*(?:free\s*spins?|freespins?|tours?\s+gratuits?|FS))?",
-
-        # Single spins last, so compound offers are not truncated.
-        r"\b\d{1,5}\s*(?:mega\s*spins?|megaspins?|free\s*spins?|freespins?|tours?\s+gratuits?|FS)\b",
+        r"\b\d{1,3}\s*%\s*(?:up\s*to|jusqu[’'`]?a|jusqu[’'`]?à|bonus)?\s*(?:C?\$|€|£)?\s*\d{1,6}(?:[.,]\d{1,2})?(?:\s*\+\s*\d{1,5}\s*(?:free\s*spins?|tours?\s+gratuits?|FS))?",
+        r"\b(?:C?\$|€|£)\s*\d{1,6}(?:[.,]\d{1,2})?(?:\s*\+\s*\d{1,5}\s*(?:free\s*spins?|tours?\s+gratuits?|FS))?",
+        r"\b\d{1,5}\s*(?:free\s*spins?|tours?\s+gratuits?|FS)\b",
     )
 
     for pattern in patterns:
         match = re.search(pattern, plain, flags=re.I)
         if match:
             return normalize_space(match.group(0))[:300]
-
     return ""
 
 
 def extract_bonus(ctx: PageContext, source: SourceConfig) -> str:
-    rule = safe_text(source.bonus_footprint)
-    if not rule or rule.lower() == "skip":
+    footprint = safe_text(source.bonus_footprint)
+    if not footprint or footprint.lower() == "skip":
         return ""
 
-    collected: List[str] = []
+    extraction_rule = safe_text(source.bonus_extraction_rule).strip()
 
-    for token in split_or(rule):
+    # New universal mode: table says WHERE and WHAT; engine only executes it.
+    if extraction_rule:
+        for token in split_or(footprint):
+            scoped = extract_bonus_source(ctx, token)
+            if not scoped:
+                continue
+            value = apply_bonus_extraction_rule(scoped, extraction_rule)
+            if value:
+                return value
+        return ""
+
+    # Backward-compatible legacy mode.
+    collected: List[str] = []
+    for token in split_or(footprint):
         low = token.lower()
         value = ""
 
         if low == "generic":
             value = generic_bonus(ctx.html())
-
-        elif low.startswith("faq:"):
-            needle = token.split(":", 1)[1].strip()
-            answer = extract_faq_answer(ctx.html(), needle)
-            if answer:
-                # Prefer a concise bonus phrase, but keep the FAQ answer when
-                # it uses wording not covered by generic_bonus().
-                value = generic_bonus(answer) or answer
-                return normalize_space(value)[:500]
-
-        elif low.startswith("section-id:"):
-            section_id = token.split(":", 1)[1].strip()
-            section_html = extract_section_html_by_id(ctx.html(), section_id)
-            if section_html:
-                value = generic_bonus(section_html)
-                if value:
-                    return normalize_space(value)[:500]
-
+        elif (
+            low.startswith(("faq:", "section-id:", "heading-regex:", "meta:"))
+            or low == "title"
+        ):
+            scoped = extract_bonus_source(ctx, token)
+            value = generic_bonus(scoped) if scoped else ""
         elif low.startswith("attr:"):
-            value = extract_attr(ctx.html(), token.split(":", 1)[1].strip())
-
+            value = extract_attr(
+                ctx.html(), token.split(":", 1)[1].strip()
+            )
         elif low.startswith("class:"):
             value = extract_text_by_class_contains(
                 ctx.html(), token.split(":", 1)[1].strip()
             )
-
         elif low.startswith("data-testid:"):
             value = extract_text_by_data_testid(
                 ctx.html(), token.split(":", 1)[1].strip()
             )
-
         elif low.startswith("regex-html:"):
             pattern = token.split(":", 1)[1].strip()
             match = re.search(pattern, ctx.html(), flags=re.I | re.S)
             if match:
                 value = match.group(1) if match.groups() else match.group(0)
-
-        # Preserve legacy behavior for old/unrecognized values.
         else:
             value = generic_bonus(ctx.html())
 
